@@ -3,11 +3,15 @@ import re
 import sys
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 # ---------------- CONFIG ----------------
 THRESH_V = 0.4
 PUF_SIG = "Out0"
-COUNTER_BITS = ["q0", "q1", "q2"]  # LSB -> MSB
+COUNTER_BITS = ["q0", "q1", "q2"]   # LSB -> MSB
+OUT_PREFIX = "E_"                  # CSV signal names look like E_Out0_iter0
+BIN_EDGES = [-np.inf, 1, 2, 3, np.inf]
+BIN_LABELS = ["≤1", "1–2", "2–3", ">3"]
 # ---------------------------------------
 
 PARAM_RE = re.compile(r"Parameters:\s*mc_iteration\s*=\s*(\d+)", re.IGNORECASE)
@@ -56,134 +60,235 @@ def parse_csv_blocks(path: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["mc", "sig", "iter", "value"])
 
 
-def build_tensor(df, n_mc, n_iter, sigs):
+def build_tensor(df: pd.DataFrame, n_mc: int, n_iter: int, sigs):
     tensor = {}
     for sig in sigs:
-        mat = np.full((n_mc, n_iter), np.nan)
+        mat = np.full((n_mc, n_iter), np.nan, dtype=float)
         sub = df[df["sig"].str.lower() == sig.lower()]
+        # iterrows is OK for your scale; keep simple/robust
         for _, r in sub.iterrows():
-            mc, it = int(r["mc"]), int(r["iter"])
+            mc = int(r["mc"])
+            it = int(r["iter"])
             if 1 <= mc <= n_mc and 0 <= it < n_iter:
-                mat[mc-1, it] = r["value"]
+                mat[mc - 1, it] = float(r["value"])
         tensor[sig] = mat
     return tensor
 
 
 # -------- BIT & RELIABILITY --------
-def to_bits(mat, thresh):
+def to_bits(mat: np.ndarray, thresh: float) -> np.ndarray:
+    # returns float array {0,1,nan}
     return np.where(np.isnan(mat), np.nan, (mat > thresh).astype(float))
 
 
-def puf_reliability(bits):
+def puf_majority_and_stability(bits: np.ndarray):
+    """
+    bits: (n_mc, n_iter) in {0,1,nan}
+    Returns:
+      maj: (n_mc,) majority bit (ties -> 1)
+      stability: (n_mc,) fraction of reads matching majority
+      strict: (n_mc,) 1 if all reads identical (ignoring NaN), else 0
+    """
     ones  = np.nansum(bits == 1, axis=1)
     zeros = np.nansum(bits == 0, axis=1)
-    valid = ones + zeros
 
-    maj = np.where(ones >= zeros, 1.0, 0.0)
+    maj = np.where(ones >= zeros, 1.0, 0.0)  # ties -> 1
     matches = np.where(np.isnan(bits), np.nan, (bits == maj[:, None]).astype(float))
     stability = np.nanmean(matches, axis=1)
 
-    strict = np.full(bits.shape[0], np.nan)
+    strict = np.full(bits.shape[0], np.nan, dtype=float)
     for i in range(bits.shape[0]):
         b = bits[i, :]
         b = b[~np.isnan(b)]
-        strict[i] = 1.0 if b.size > 0 and np.all(b == b[0]) else 0.0
+        if b.size == 0:
+            strict[i] = np.nan
+        else:
+            strict[i] = 1.0 if np.all(b == b[0]) else 0.0
 
     return maj, stability, strict
 
 
+def ber_per_mc(bits: np.ndarray, maj: np.ndarray) -> np.ndarray:
+    """
+    Intra-chip BER per MC:
+      BER_i = mean_j [ bits[i,j] != maj[i] ] over valid reads
+    Returns fraction in [0,1]
+    """
+    ber = np.full(bits.shape[0], np.nan, dtype=float)
+    for i in range(bits.shape[0]):
+        b = bits[i, :]
+        b = b[~np.isnan(b)]
+        if b.size == 0:
+            ber[i] = np.nan
+        else:
+            ber[i] = np.mean(b != maj[i])
+    return ber
+
+
 # -------- COUNTER --------
-def counter_values(q_bits):
-    q0, q1, q2 = q_bits["q0"], q_bits["q1"], q_bits["q2"]
+def counter_values(q_bits_dict):
+    """
+    q_bits_dict: q0..q2 each (n_mc,n_iter) {0,1,nan}
+    returns cnt (n_mc,n_iter) float with nan if any bit nan in that read
+    """
+    q0, q1, q2 = (q_bits_dict["q0"], q_bits_dict["q1"], q_bits_dict["q2"])
     valid = ~(np.isnan(q0) | np.isnan(q1) | np.isnan(q2))
-    cnt = np.full(q0.shape, np.nan)
-    cnt[valid] = q0[valid] + 2*q1[valid] + 4*q2[valid]
+    cnt = np.full(q0.shape, np.nan, dtype=float)
+    cnt[valid] = (q0[valid] + 2*q1[valid] + 4*q2[valid])
     return cnt
 
 
-# -------- MAIN --------
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 analyze_transient_counter.py <csv>")
-        sys.exit(1)
-
-    df = parse_csv_blocks(sys.argv[1])
-    if df.empty:
-        raise SystemExit("No valid data parsed.")
-
-    n_mc   = int(df["mc"].max())
-    n_iter = int(df["iter"].max()) + 1
-
-    tensor = build_tensor(df, n_mc, n_iter, [PUF_SIG] + COUNTER_BITS)
-
-    puf_bits = to_bits(tensor[PUF_SIG], THRESH_V)
-    q_bits   = {q: to_bits(tensor[q], THRESH_V) for q in COUNTER_BITS}
-
-    maj, stability, strict = puf_reliability(puf_bits)
-    flaky = ((stability < 1.0) & ~np.isnan(stability)).astype(int)
-
-    cnt = counter_values(q_bits)
-
-    # ---- per-MC stats ----
-    cnt_mode = np.full(n_mc, np.nan)
-    cnt_mean = np.full(n_mc, np.nan)
-    cnt_max  = np.full(n_mc, np.nan)
+def per_mc_counter_stats(cnt: np.ndarray):
+    """
+    cnt: (n_mc,n_iter) float with NaN
+    Returns per-MC: mode, mean, median, max, frac_ge3
+    """
+    n_mc = cnt.shape[0]
+    mode = np.full(n_mc, np.nan)
+    mean = np.full(n_mc, np.nan)
+    med  = np.full(n_mc, np.nan)
+    mx   = np.full(n_mc, np.nan)
+    frac_ge3 = np.full(n_mc, np.nan)
 
     for i in range(n_mc):
         v = cnt[i, :]
         v = v[~np.isnan(v)]
         if v.size == 0:
             continue
-        vals, counts = np.unique(v.astype(int), return_counts=True)
-        cnt_mode[i] = vals[np.argmax(counts)]
-        cnt_mean[i] = np.mean(v)
-        cnt_max[i]  = np.max(v)
+        vi = v.astype(int)
+        vals, counts = np.unique(vi, return_counts=True)
+        mode[i] = float(vals[np.argmax(counts)])
+        mean[i] = float(np.mean(v))
+        med[i]  = float(np.median(v))
+        mx[i]   = float(np.max(v))
+        frac_ge3[i] = float(np.mean(v >= 3))
+    return mode, mean, med, mx, frac_ge3
+
+
+# -------- PLOT --------
+def plot_ber_vs_activity(per_mc: pd.DataFrame, out_png: str):
+    """
+    Bar (left): count of MCs per bin
+    Line (right): mean BER (%) per bin
+    """
+    # bin by mean oscillation count
+    df = per_mc.copy()
+    df = df.dropna(subset=["cnt_mean", "ber"])
+
+    df["bin"] = pd.cut(df["cnt_mean"], bins=BIN_EDGES, labels=BIN_LABELS)
+
+    count_by_bin = df.groupby("bin")["ber"].count().reindex(BIN_LABELS)
+    ber_by_bin   = (df.groupby("bin")["ber"].mean().reindex(BIN_LABELS) * 100.0)  # %
+
+    # positions: tighter spacing
+    x = np.arange(len(BIN_LABELS))
+
+    # figure style
+    plt.figure(figsize=(10, 5.2), dpi=200)
+    ax1 = plt.gca()
+
+    # Bars: use a muted palette; edge in black
+    bar_width = 0.55
+    bar_colors = ["#9aa0a6", "#bdbdbd", "#cfcfcf", "#e0e0e0"]  # subtle shades
+    bars = ax1.bar(x, count_by_bin.values, width=bar_width,
+                   color=bar_colors, edgecolor="black", linewidth=1.0)
+
+    ax1.set_ylabel("Number of MC instances", fontsize=13)
+    ax1.set_xlabel("Mean transient oscillation count (binned)", fontsize=13)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(BIN_LABELS, fontsize=12)
+    ax1.tick_params(axis='y', labelsize=12)
+    ax1.grid(axis="y", linestyle="-", linewidth=0.6, alpha=0.25)
+
+    # Annotate bar counts
+    for b, val in zip(bars, count_by_bin.values):
+        if np.isnan(val):
+            continue
+        ax1.text(b.get_x() + b.get_width()/2, b.get_height() + max(count_by_bin.values)*0.02,
+                 f"{int(val)}", ha="center", va="bottom", fontsize=11)
+
+    # Line on secondary axis: BER
+    ax2 = ax1.twinx()
+    ax2.plot(x, ber_by_bin.values, marker="o", linewidth=2.5, color="black")
+    ax2.set_ylabel("BER (%)", fontsize=13)
+    ax2.tick_params(axis='y', labelsize=12)
+
+    # BER point labels (optional, helps if some are 0)
+    for xi, yi in zip(x, ber_by_bin.values):
+        if np.isnan(yi):
+            continue
+        ax2.text(xi, yi + max(ber_by_bin.values)*0.03 if max(ber_by_bin.values) > 0 else yi + 0.05,
+                 f"{yi:.2f}", ha="center", va="bottom", fontsize=11)
+
+    plt.title("PUF BER vs. Transient Oscillation Activity", fontsize=16, pad=10)
+    plt.tight_layout()
+    plt.savefig(out_png, bbox_inches="tight")
+    print(f"Wrote figure: {out_png}")
+
+
+# -------- MAIN --------
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 analyze_transient_counter.py <csv> [--plot]")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    do_plot = ("--plot" in sys.argv[2:])
+
+    df = parse_csv_blocks(path)
+    if df.empty:
+        raise SystemExit("No valid data parsed. Check output names: E_Out0_iter#, E_q*_iter#")
+
+    n_mc = int(df["mc"].max())
+    n_iter = int(df["iter"].max()) + 1
+
+    sigs = [PUF_SIG] + COUNTER_BITS
+    tensor = build_tensor(df, n_mc, n_iter, sigs)
+
+    # bits
+    puf_bits = to_bits(tensor[PUF_SIG], THRESH_V)
+    q_bits = {q: to_bits(tensor[q], THRESH_V) for q in COUNTER_BITS}
+
+    # PUF majority/stability/strict + BER
+    maj, stability, strict = puf_majority_and_stability(puf_bits)
+    ber = ber_per_mc(puf_bits, maj)  # fraction
+
+    # Counter stats
+    cnt = counter_values(q_bits)
+    cnt_mode, cnt_mean, cnt_med, cnt_max, frac_ge3 = per_mc_counter_stats(cnt)
 
     per_mc = pd.DataFrame({
-        "mc": np.arange(1, n_mc+1),
+        "mc": np.arange(1, n_mc + 1),
+        "maj": maj,
         "stability": stability,
         "strict": strict,
-        "flaky": flaky,
+        "ber": ber,                  # fraction
         "cnt_mode": cnt_mode,
         "cnt_mean": cnt_mean,
-        "cnt_max": cnt_max
+        "cnt_median": cnt_med,
+        "cnt_max": cnt_max,
+        "cnt_frac_ge3": frac_ge3,
     })
 
-    print("\n=== SUMMARY ===")
-    print(f"MC instances: {n_mc}")
-    print(f"Reads/MC:     {n_iter}")
-    print(f"Mean stability: {np.nanmean(stability):.4f}")
-    print(f"Strict stable:  {np.nanmean(strict):.4f}")
-    print(f"Flaky MCs:      {np.sum(flaky)}")
+    # Summary
+    print("=== Summary ===")
+    print(f"MC instances:        {n_mc}")
+    print(f"Iterations (reads):  {n_iter}")
+    print(f"Threshold (V):       {THRESH_V}")
+    print()
+    print(f"Overall stability mean: {np.nanmean(stability):.6f}")
+    print(f"Overall strict mean:    {np.nanmean(strict):.6f}")
+    print(f"Overall BER mean:       {np.nanmean(ber)*100:.6f}%")
 
-    # ---- MODE TABLE ----
-    print("\n=== By COUNTER MODE ===")
-    grp = per_mc.dropna().groupby("cnt_mode")["flaky"].agg(total="count", flaky="sum")
-    grp["stable"] = grp["total"] - grp["flaky"]
-    grp["flaky_frac"] = grp["flaky"] / grp["total"]
-    print(grp)
+    # Save per-mc
+    out_csv = "per_mc_transient.csv"
+    per_mc.to_csv(out_csv, index=False)
+    print(f"\nWrote per-MC table: {out_csv}")
 
-    # ---- MEAN TABLE ----
-    print("\n=== By COUNTER MEAN (binned) ===")
-    per_mc["mean_bin"] = pd.cut(
-        per_mc["cnt_mean"],
-        bins=[0, 1.5, 2.5, np.inf],
-        labels=["<1.5", "1.5–2.5", "≥2.5"]
-    )
-    grp = per_mc.dropna().groupby("mean_bin")["flaky"].agg(total="count", flaky="sum")
-    grp["stable"] = grp["total"] - grp["flaky"]
-    grp["flaky_frac"] = grp["flaky"] / grp["total"]
-    print(grp)
-
-    # ---- MAX TABLE ----
-    print("\n=== By COUNTER MAX ===")
-    grp = per_mc.dropna().groupby("cnt_max")["flaky"].agg(total="count", flaky="sum")
-    grp["stable"] = grp["total"] - grp["flaky"]
-    grp["flaky_frac"] = grp["flaky"] / grp["total"]
-    print(grp)
-
-    per_mc.to_csv("per_mc_transient.csv", index=False)
-    print("\nWrote per_mc_transient.csv")
+    # Optional plot
+    if do_plot:
+        out_png = "ber_vs_osc_activity.png"
+        plot_ber_vs_activity(per_mc, out_png)
 
 
 if __name__ == "__main__":
