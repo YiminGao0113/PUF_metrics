@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
-import sys
+"""
+Simplified, paper-style CDF figure (Option A):
+- Only ONE ECDF curve (all MC instances)
+- Shade the contiguous BER=0 region from left
+- Mark T_safe boundary (first appearance of BER>0)
+
+Usage:
+  python3 plot_cdf_threshold.py per_mc_transient.csv
+  python3 plot_cdf_threshold.py per_mc_transient.csv --metric cnt_mean --ber ber
+  python3 plot_cdf_threshold.py per_mc_transient.csv --force_t 2.0
+"""
+
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
 
 def ecdf_step(x: np.ndarray):
     x = np.asarray(x, dtype=float)
@@ -11,89 +24,92 @@ def ecdf_step(x: np.ndarray):
         return np.array([0.0, 1.0]), np.array([0.0, 0.0])
     xs = np.sort(x)
     ys = np.arange(1, xs.size + 1) / xs.size
+    # start at y=0 with the first x
     xs = np.concatenate(([xs[0]], xs))
     ys = np.concatenate(([0.0], ys))
     return xs, ys
 
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 plot_cdf_safe.py per_mc_transient.csv")
-        sys.exit(1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv", help="per_mc_transient.csv")
+    ap.add_argument("--metric", default="cnt_mean", help="metric column (default: cnt_mean)")
+    ap.add_argument("--ber", default="ber", help="BER column (fraction, default: ber)")
+    ap.add_argument("--force_t", type=float, default=None,
+                    help="Force T_safe to this value instead of auto (e.g., 2.0)")
+    ap.add_argument("--out", default="cdf_transient_metric_threshold.png")
+    args = ap.parse_args()
 
-    df = pd.read_csv(sys.argv[1])
+    df = pd.read_csv(args.csv)
+    if args.metric not in df.columns or args.ber not in df.columns:
+        raise SystemExit(f"Missing columns. Need metric='{args.metric}' and ber='{args.ber}' in CSV.")
 
-    metric_col = "cnt_mean"   # change if you want cnt_max / cnt_frac_ge3 etc.
-    ber_col    = "ber"
+    df = df.dropna(subset=[args.metric, args.ber]).copy()
+    x_all = df[args.metric].astype(float).to_numpy()
+    ber   = df[args.ber].astype(float).to_numpy()
 
-    df = df.dropna(subset=[metric_col, ber_col]).copy()
-    x_all = df[metric_col].astype(float).to_numpy()
-    ber   = df[ber_col].astype(float).to_numpy()
+    if x_all.size == 0:
+        raise SystemExit("No valid rows after dropna.")
 
     xmin = float(np.min(x_all))
     xmax = float(np.max(x_all))
 
+    # --- Determine contiguous BER=0 safe boundary from the left ---
+    # T_safe := first x where BER>0 appears (conservative boundary).
     flaky_mask = ber > 0
-    x_flaky = x_all[flaky_mask]
-
-    # ---- contiguous safe threshold from the left ----
-    # Find smallest x where BER>0. Shade everything to the left of that.
-    if np.any(flaky_mask):
-        x_first_flaky = float(np.min(x_all[flaky_mask]))
-        t_safe = x_first_flaky  # boundary where errors start appearing
+    if args.force_t is not None:
+        t_safe = float(args.force_t)
     else:
-        t_safe = xmax  # no errors at all
+        if np.any(flaky_mask):
+            t_safe = float(np.min(x_all[flaky_mask]))
+        else:
+            t_safe = xmax  # no errors at all
 
-    # ECDFs
+    # ECDF for all MC instances
     xs_all, ys_all = ecdf_step(x_all)
 
-    if x_flaky.size > 0:
-        xs_f, ys_f = ecdf_step(x_flaky)
-        # extend flaky CDF to full x-range visually
-        if xs_f[0] > xmin:
-            xs_f = np.concatenate(([xmin], xs_f))
-            ys_f = np.concatenate(([0.0], ys_f))
-    else:
-        xs_f = np.array([xmin, xmax], dtype=float)
-        ys_f = np.array([0.0, 0.0], dtype=float)
-
+    # ---------- Styling: clean / TCAS-friendly ----------
     plt.rcParams.update({
         "font.size": 14,
         "axes.titlesize": 22,
         "axes.labelsize": 18,
-        "legend.fontsize": 14,
         "xtick.labelsize": 14,
         "ytick.labelsize": 14,
+        "legend.fontsize": 14,
         "axes.linewidth": 1.2,
     })
 
     fig, ax = plt.subplots(figsize=(9.6, 5.6), dpi=200)
 
-    # Shade safe region (contiguous from left)
+    # Shade contiguous BER=0 region
     ax.axvspan(xmin, t_safe, color="0.92", zorder=0, label="BER = 0 (contiguous safe zone)")
 
-    ax.step(xs_all, ys_all, where="post", color="black", linewidth=2.6, label="All MC instances")
-    ax.step(xs_f, ys_f, where="post", color="#B22222", linestyle="--",
-            linewidth=2.6, label="Flaky instances (BER > 0)")
+    # Single ECDF curve
+    ax.step(xs_all, ys_all, where="post", color="black", linewidth=2.8, label="All MC instances")
 
-    # boundary marker
-    ax.axvline(t_safe, color="0.35", linestyle=":", linewidth=2.0)
-    ax.text(t_safe, 0.03, f"  T_safe = {t_safe:.2f}", rotation=90,
-            va="bottom", ha="left", color="0.35")
+    # Boundary line + annotation (minimal)
+    ax.axvline(t_safe, color="0.35", linestyle="--", linewidth=2.0)
+    ax.text(t_safe, 1.01, f"T_safe ≈ {t_safe:.2f}",
+            ha="center", va="bottom", color="0.35", fontsize=14)
 
     ax.set_title("CDF of Transient Oscillation Metric")
     ax.set_xlabel("Mean transient oscillation count")
     ax.set_ylabel("Cumulative fraction of MC instances")
-    ax.set_xlim(xmin, xmax)
+    # ax.set_xlim(xmin, xmax)
+    ax.set_xlim(0, 3.5)
     ax.set_ylim(0.0, 1.02)
 
+    # Light y-grid only (clean)
     ax.grid(True, which="major", axis="y", alpha=0.25)
     ax.grid(False, axis="x")
+
+    # Put legend bottom-right; small and clean
     ax.legend(loc="lower right", frameon=True)
 
-    out = "cdf_transient_metric_safe.png"
     plt.tight_layout()
-    plt.savefig(out, bbox_inches="tight")
-    print(f"Wrote: {out}")
+    plt.savefig(args.out, bbox_inches="tight")
+    print(f"Wrote: {args.out}")
+
 
 if __name__ == "__main__":
     main()
