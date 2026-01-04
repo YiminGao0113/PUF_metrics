@@ -165,66 +165,119 @@ def per_mc_counter_stats(cnt: np.ndarray):
     return mode, mean, med, mx, frac_ge3
 
 
-# -------- PLOT --------
 def plot_ber_vs_activity(per_mc: pd.DataFrame, out_png: str):
     """
-    Bar (left): count of MCs per bin
-    Line (right): mean BER (%) per bin
+    Paper-ready plot:
+      - Bars (left): # MC instances per bin
+      - Line (right): mean BER (%) per bin
+      - Safe-zone shading: contiguous bins from left with BER==0
+      - No markers/labels for BER==0 bins
     """
-    # bin by mean oscillation count
     df = per_mc.copy()
     df = df.dropna(subset=["cnt_mean", "ber"])
 
-    df["bin"] = pd.cut(df["cnt_mean"], bins=BIN_EDGES, labels=BIN_LABELS)
+    # Bin by mean oscillation count
+    df["bin"] = pd.cut(
+        df["cnt_mean"],
+        bins=BIN_EDGES,
+        labels=BIN_LABELS,
+        right=True,
+        include_lowest=True
+    )
 
-    count_by_bin = df.groupby("bin")["ber"].count().reindex(BIN_LABELS)
-    ber_by_bin   = (df.groupby("bin")["ber"].mean().reindex(BIN_LABELS) * 100.0)  # %
+    g = df.groupby("bin")["ber"]
+    count_by_bin = g.count().reindex(BIN_LABELS).fillna(0).astype(int)
+    ber_mean = (g.mean().reindex(BIN_LABELS).fillna(0.0) * 100.0)  # %
 
-    # positions: tighter spacing
     x = np.arange(len(BIN_LABELS))
 
-    # figure style
-    plt.figure(figsize=(10, 5.2), dpi=200)
+    plt.figure(figsize=(7.4, 3.8), dpi=300)
     ax1 = plt.gca()
 
-    # Bars: use a muted palette; edge in black
-    bar_width = 0.55
-    bar_colors = ["#9aa0a6", "#bdbdbd", "#cfcfcf", "#e0e0e0"]  # subtle shades
-    bars = ax1.bar(x, count_by_bin.values, width=bar_width,
-                   color=bar_colors, edgecolor="black", linewidth=1.0)
+    # ---- Safe-zone shading: contiguous BER==0 bins from the left ----
+    safe_last = -1
+    for i, v in enumerate(ber_mean.values):
+        if np.isclose(v, 0.0):
+            safe_last = i
+        else:
+            break
+    if safe_last >= 0:
+        ax1.axvspan(-0.5, safe_last + 0.5, color="0.95", zorder=0)
 
-    ax1.set_ylabel("Number of MC instances", fontsize=13)
+    # ---- Bars ----
+    bar_colors = ["0.82", "0.72", "0.62", "0.52"]
+    bars = ax1.bar(
+        x, count_by_bin.values,
+        width=0.72,
+        color=bar_colors,
+        edgecolor="black",
+        linewidth=0.9,
+        zorder=2
+    )
+    # ---- FIX: add headroom so bar labels don’t hit top border ----
+    ymax = np.nanmax(count_by_bin.values)
+    ax1.set_ylim(0, ymax * 1.12)
+
     ax1.set_xlabel("Mean transient oscillation count (binned)", fontsize=13)
+    ax1.set_ylabel("Number of MC instances", fontsize=13)
     ax1.set_xticks(x)
     ax1.set_xticklabels(BIN_LABELS, fontsize=12)
-    ax1.tick_params(axis='y', labelsize=12)
-    ax1.grid(axis="y", linestyle="-", linewidth=0.6, alpha=0.25)
+    ax1.tick_params(axis="y", labelsize=12)
+    ax1.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.30, zorder=1)
 
-    # Annotate bar counts
+    # Count labels (slightly lower to avoid title overlap)
+    ymax = max(1, int(count_by_bin.max()))
     for b, val in zip(bars, count_by_bin.values):
-        if np.isnan(val):
+        if np.isnan(val) or val == 0:
             continue
-        ax1.text(b.get_x() + b.get_width()/2, b.get_height() + max(count_by_bin.values)*0.02,
-                 f"{int(val)}", ha="center", va="bottom", fontsize=11)
 
-    # Line on secondary axis: BER
+        h = b.get_height()
+        xloc = b.get_x() + b.get_width() / 2
+
+        # If bar is very tall, place label inside
+        
+        ax1.text(
+            xloc, h + 0.02 * ymax,
+            f"{int(val)}",
+            ha="center", va="bottom",
+            fontsize=11)
+
+    # ---- BER line on secondary axis ----
     ax2 = ax1.twinx()
-    ax2.plot(x, ber_by_bin.values, marker="o", linewidth=2.5, color="black")
     ax2.set_ylabel("BER (%)", fontsize=13)
-    ax2.tick_params(axis='y', labelsize=12)
+    ax2.tick_params(axis="y", labelsize=12)
 
-    # BER point labels (optional, helps if some are 0)
-    for xi, yi in zip(x, ber_by_bin.values):
-        if np.isnan(yi):
-            continue
-        ax2.text(xi, yi + max(ber_by_bin.values)*0.03 if max(ber_by_bin.values) > 0 else yi + 0.05,
-                 f"{yi:.2f}", ha="center", va="bottom", fontsize=11)
+    # Plot line through all bins, BUT only show markers where BER>0
+    y = ber_mean.values
+    ax2.plot(x, y, color="black", linewidth=2.2, zorder=3)
 
-    plt.title("PUF BER vs. Transient Oscillation Activity", fontsize=16, pad=10)
+    idx_pos = np.where(y > 0)[0]
+    ax2.plot(
+        x[idx_pos], y[idx_pos],
+        linestyle="none",
+        marker="o",
+        markersize=5.5,
+        color="black",
+        zorder=4
+    )
+
+    # BER labels only for BER>0
+    ber_ymax = max(1.0, float(np.max(y)))
+    for xi, yi in zip(x[idx_pos], y[idx_pos]):
+        ax2.text(
+            xi,
+            yi + 0.06 * ber_ymax,
+            f"{yi:.2f}",
+            ha="center", va="bottom",
+            fontsize=10
+        )
+
+    ax2.set_ylim(0, max(1.0, ber_ymax * 1.25))
+
+    plt.title("BER vs. Transient Oscillation Activity", fontsize=14, pad=6)
     plt.tight_layout()
     plt.savefig(out_png, bbox_inches="tight")
     print(f"Wrote figure: {out_png}")
-
 
 # -------- MAIN --------
 def main():
